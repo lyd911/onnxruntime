@@ -13,92 +13,30 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-
-// Implements the math functions for CPU.
-// The implementation in this file allows us to route the underlying numerical
-// computation library to different backends. Notably:
-// (1) For all BLAS-related functions, one can explicitly request a BLAS backend
-//     such as MKL, openblas or Atlas. To see the set of supported backends
-//     currently provided, check //third_party/blas/.
-// (2) If one chooses to link against MKL, we utilize MKL's vector math library
-//     (VML) for a few functions such as Exp and Log.
-// (3) Fallback implementations are provided in Eigen for cross-platform
-//     support. Since Eigen is a header-only library and supports a number of
-//     platforms, it allows one to quickly port Caffe2 to different platforms
-//     where BLAS may not be present.
 // Modifications Copyright (c) Microsoft.
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <random>
-#include <unordered_set>
-#include "core/platform/env.h"
-#include "core/common/logging/logging.h"
-#include "core/providers/cpu/cpu_execution_provider.h"
 #include "core/util/math.h"
 #include "core/util/math_cpuonly.h"
-#include "Eigen/src/Core/arch/GPU/Half.h"
-
-#if defined(USE_MLAS)
 #include "core/mlas/inc/mlas.h"
-#endif
+#include "Eigen/src/Core/arch/Default/Half.h"
+using onnxruntime::concurrency::ThreadPool;
 
 namespace onnxruntime {
 namespace math {
 
-// Gemm implementation purely based on Eigen.
-template <typename T>
-void GemmEigen(
-    CBLAS_TRANSPOSE TransA,
-    CBLAS_TRANSPOSE TransB,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    float alpha,
-    const T* A,
-    const T* B,
-    float beta,
-    T* C) {
-  auto C_mat = EigenMatrixMap<T>(C, N, M);
-  if (beta == 0) {
-    C_mat.setZero();
-  } else {
-    C_mat *= static_cast<T>(beta);
+// MatMul implementation purely based on Eigen.
+#define EIGEN_MATMUL_FUNCTION(T)                                                                \
+  template <>                                                                                   \
+  void MatMul<T>(int M, int N, int K, const T* A, const T* B, T* C, concurrency::ThreadPool*) { \
+    auto C_mat = EigenMatrixMap<T>(C, N, M);                                                    \
+    C_mat.noalias() = ConstEigenMatrixMap<T>(B, N, K) * ConstEigenMatrixMap<T>(A, K, M);        \
   }
-  switch (TransA) {
-    case CblasNoTrans: {
-      switch (TransB) {
-        case CblasNoTrans:
-          C_mat.noalias() += static_cast<T>(alpha) * (ConstEigenMatrixMap<T>(B, N, K) *
-                                                      ConstEigenMatrixMap<T>(A, K, M));
-          return;
-        case CblasTrans:
-          C_mat.noalias() += static_cast<T>(alpha) * (ConstEigenMatrixMap<T>(B, K, N).transpose() *
-                                                      ConstEigenMatrixMap<T>(A, K, M));
-          return;
-        default:
-          ORT_THROW("CblasNoTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
-      }
-    }
-    case CblasTrans: {
-      switch (TransB) {
-        case CblasNoTrans:
-          C_mat.noalias() += static_cast<T>(alpha) * (ConstEigenMatrixMap<T>(B, N, K) *
-                                                      ConstEigenMatrixMap<T>(A, M, K).transpose());
-          return;
-        case CblasTrans:
-          C_mat.noalias() += static_cast<T>(alpha) * (ConstEigenMatrixMap<T>(B, K, N).transpose() *
-                                                      ConstEigenMatrixMap<T>(A, M, K).transpose());
-          return;
-        default:
-          ORT_THROW("CblasTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
-      }
-    }
-    default:
-      ORT_THROW("Unexpected CBLAS_TRANSPOSE for TransA of ", TransA);
-  }
-}
+
+EIGEN_MATMUL_FUNCTION(int32_t)
+EIGEN_MATMUL_FUNCTION(uint32_t)
+EIGEN_MATMUL_FUNCTION(int64_t)
+EIGEN_MATMUL_FUNCTION(uint64_t)
 
 ////////////////////////////////////////////////////////////////////////////////
 // BLAS alternatives.
@@ -107,7 +45,7 @@ void GemmEigen(
 // CBLAS call or the Eigen implementation.
 ////////////////////////////////////////////////////////////////////////////////
 // when USE_MKLML is defined, use cblas APIs for MKLML
-#if defined(USE_EIGEN_FOR_BLAS) && !defined(USE_MKLML_FOR_BLAS)
+#if !defined(USE_MKLML_FOR_BLAS)
 
 // Caffe2 gemm provides a simpler interface to the gemm functions, with the
 // limitation that the data has to be contiguous in memory.
@@ -125,117 +63,38 @@ void GemmEigen(
 // (transpose) if the argument TransA or TransB is set to CblasNoTrans or
 // CblasTrans, respectively, for each of A and B.
 template <>
-void Gemm<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                              const int64_t N, const int64_t K, float alpha, const float* A, const float* B, float beta,
-                              float* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-#if defined(USE_MLAS)
+void Gemm<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
+                             const int64_t N, const int64_t K, float alpha, const float* A, const float* B, float beta,
+                             float* C, ThreadPool* threadpool) {
   int lda = static_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = static_cast<int>((TransB == CblasNoTrans) ? N : K);
-  // TODO: Make this use the operator threadpool
-  MlasSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, nullptr);
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, N, threadpool);
+}
+
+template <>
+void MatMul<float>(int M, int N, int K, const float* A, const float* B, float* C, ThreadPool* threadpool) {
+  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
+}
+
+#if defined(_M_AMD64) || defined(__x86_64__)
+template <>
+void MatMul<double>(int M, int N, int K, const double* A, const double* B, double* C, ThreadPool* threadpool) {
+  MlasGemm(CblasNoTrans, CblasNoTrans, M, N, K, 1.f, A, K, B, N, 0.f, C, N, threadpool);
+}
 #else
-  GemmEigen<float>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
+EIGEN_MATMUL_FUNCTION(double)
 #endif
-}
 
 template <>
-void Gemm<double, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                               const int64_t N, const int64_t K, float alpha, const double* A, const double* B,
-                               float beta, double* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No double precision Gemm offering from MLAS or MKLDNN. Directly fallback to Eigen.
-  GemmEigen<double>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<int32_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                const int64_t N, const int64_t K, float alpha, const int32_t* A, const int32_t* B,
-                                float beta, int32_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No int32_t Gemm offering from MLAS or MKLDNN. Directly fallback to Eigen.
-  GemmEigen<int32_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<uint32_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                 const int64_t N, const int64_t K, float alpha, const uint32_t* A, const uint32_t* B,
-                                 float beta, uint32_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No uint32_t Gemm offering from MLAS or MKLDNN. Directly fallback to Eigen.
-  GemmEigen<uint32_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<int64_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                const int64_t N, const int64_t K, float alpha, const int64_t* A, const int64_t* B,
-                                float beta, int64_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No int64_t Gemm offering from MLAS or MKLDNN. Directly fallback to Eigen.
-  GemmEigen<int64_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<uint64_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                 const int64_t N, const int64_t K, float alpha, const uint64_t* A, const uint64_t* B,
-                                 float beta, uint64_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No uint64_t Gemm offering from MLAS or MKLDNN. Directly fallback to Eigen.
-  GemmEigen<uint64_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void GemmEx<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int M, int N, int K,
-                                float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
-                                int ldc, CPUMathUtil*) {
-#if defined(USE_MLAS)
-  MlasSgemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, nullptr);
-#else
-  using OuterStride = Eigen::OuterStride<Eigen::Dynamic>;
-  using StridedMap = Eigen::Map<Eigen::MatrixXf, 0, OuterStride>;
-  using ConstStridedMap = Eigen::Map<const Eigen::MatrixXf, 0, OuterStride>;
-  auto C_mat = StridedMap(C, N, M, OuterStride(ldc));
-  if (beta == 0) {
-    C_mat.setZero();
-  } else {
-    C_mat *= beta;
-  }
-  switch (TransA) {
-    case CblasNoTrans: {
-      switch (TransB) {
-        case CblasNoTrans:
-          C_mat.noalias() +=
-              alpha * (ConstStridedMap(B, N, K, OuterStride(ldb)) *
-                       ConstStridedMap(A, K, M, OuterStride(lda)));
-          return;
-        case CblasTrans:
-          C_mat.noalias() +=
-              alpha * (ConstStridedMap(B, K, N, OuterStride(ldb)).transpose() *
-                       ConstStridedMap(A, K, M, OuterStride(lda)));
-          return;
-        default:
-          ORT_THROW("CblasNoTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
-      }
-    }
-    case CblasTrans: {
-      switch (TransB) {
-        case CblasNoTrans:
-          C_mat.noalias() +=
-              alpha * (ConstStridedMap(B, N, K, OuterStride(ldb)) *
-                       ConstStridedMap(A, M, K, OuterStride(lda)).transpose());
-          return;
-        case CblasTrans:
-          C_mat.noalias() +=
-              alpha * (ConstStridedMap(B, K, N, OuterStride(ldb)).transpose() *
-                       ConstStridedMap(A, M, K, OuterStride(lda)).transpose());
-          return;
-        default:
-          ORT_THROW("CblasTrans Unexpected CBLAS_TRANSPOSE for TransB of ", TransB);
-      }
-    }
-    default:
-      ORT_THROW("Unexpected CBLAS_TRANSPOSE for TransA of ", TransA);
-  }
-#endif
+void GemmEx<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int M, int N, int K,
+                               float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
+                               int ldc, ThreadPool* threadpool) {
+  MlasGemm(TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, threadpool);
 }
 
 template <>
 void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const float* A, const float* x,
-                              float beta, float* y, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
+                              float beta, float* y, CPUMathUtil* /*provider*/) {
   EigenVectorMap<float> y_vec(y, TransA == CblasNoTrans ? M : N);
   if (beta == 0) {
     // In Caffe2 we often do a lazy initialization, which may contain NaNs in
@@ -260,26 +119,6 @@ void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float 
   }
 }
 
-#define SPECIALIZED_SCALE(T)                                                                           \
-  template <>                                                                                          \
-  void Scale<T, CPUMathUtil>(int n, float alpha, const T* x, T* y, CPUMathUtil* /*provider*/) {        \
-    EigenVectorMap<T>(y, n) = ConstEigenVectorMap<T>(x, n) * alpha;                                    \
-  }                                                                                                    \
-  template <>                                                                                          \
-  void Scale<T, CPUMathUtil>(int n, const float* alpha, const T* x, T* y, CPUMathUtil* /*provider*/) { \
-    EigenVectorMap<T>(y, n) = ConstEigenVectorMap<T>(x, n) * (*alpha);                                 \
-  }
-SPECIALIZED_SCALE(float)
-#undef SPECIALIZED_SCALE
-
-#define SPECIALIZED_DOT(T)                                                                   \
-  template <>                                                                                \
-  void Dot<T, CPUMathUtil>(int N, const T* a, const T* b, T* y, CPUMathUtil* /*provider*/) { \
-    *y = ConstEigenVectorMap<T>(a, N).dot(ConstEigenVectorMap<T>(b, N));                     \
-  }
-SPECIALIZED_DOT(float)
-#undef SPECIALIZED_DOT
-
 #define SPECIALIZED_AXPY(T)                                                                       \
   template <>                                                                                     \
   void Axpy<T, CPUMathUtil>(int N, const T alpha, const T* x, T* Y, CPUMathUtil* /*provider*/) {  \
@@ -292,21 +131,12 @@ SPECIALIZED_DOT(float)
 SPECIALIZED_AXPY(float)
 #undef SPECIALIZED_AXPY
 
-#define SPECIALIZED_AXPBY(T)                                                                                   \
-  template <>                                                                                                  \
-  void Axpby<T, CPUMathUtil>(int N, const T alpha, const T* x, const T beta, T* y, CPUMathUtil* /*context*/) { \
-    EigenVectorMap<T> y_vec(y, N);                                                                             \
-    y_vec = y_vec * beta + ConstEigenVectorMap<T>(x, N) * alpha;                                               \
-  }
-SPECIALIZED_AXPBY(float)
-#undef SPECIALIZED_AXPBY
-
-#else  // USE_EIGEN_FOR_BLAS
+#else
 
 template <>
-void Gemm<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                              const int64_t N, const int64_t K, float alpha, const float* A, const float* B, float beta,
-                              float* C, CPUMathUtil* /*context*/, MLDataType /*math_type*/) {
+void Gemm<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
+                             const int64_t N, const int64_t K, float alpha, const float* A, const float* B, float beta,
+                             float* C, ThreadPool* /*context*/) {
   int lda = gsl::narrow_cast<int>((TransA == CblasNoTrans) ? K : M);
   int ldb = gsl::narrow_cast<int>((TransB == CblasNoTrans) ? N : K);
   cblas_sgemm(CblasRowMajor, TransA, TransB,
@@ -318,83 +148,28 @@ void Gemm<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOS
 }
 
 template <>
-void Gemm<double, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                               const int64_t N, const int64_t K, float alpha, const double* A, const double* B,
-                               float beta, double* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  int lda = gsl::narrow_cast<int>((TransA == CblasNoTrans) ? K : M);
-  int ldb = gsl::narrow_cast<int>((TransB == CblasNoTrans) ? N : K);
-  cblas_dgemm(CblasRowMajor, TransA, TransB, gsl::narrow_cast<int>(M), gsl::narrow_cast<int>(N),
-              gsl::narrow_cast<int>(K), gsl::narrow_cast<double>(alpha), A, lda, B, ldb, gsl::narrow_cast<double>(beta),
-              C, gsl::narrow_cast<int>(N));
+void MatMul<float>(int M, int N, int K, const float* A, const float* B, float* C, ThreadPool*) {
+  cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1, A, K, B, N, 0, C, N);
 }
 
 template <>
-void Gemm<int32_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                const int64_t N, const int64_t K, float alpha, const int32_t* A, const int32_t* B,
-                                float beta, int32_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No int32_t Gemm offering from MKLML. Directly fallback to Eigen.
-  GemmEigen<int32_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
+void MatMul<double>(int M, int N, int K, const double* A, const double* B, double* C, ThreadPool*) {
+  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K, 1, A, K, B, N, 0, C, N);
 }
 
 template <>
-void Gemm<uint32_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                 const int64_t N, const int64_t K, float alpha, const uint32_t* A, const uint32_t* B,
-                                 float beta, uint32_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No uint32_t Gemm offering from MKLML. Directly fallback to Eigen.
-  GemmEigen<uint32_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<int64_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                const int64_t N, const int64_t K, float alpha, const int64_t* A, const int64_t* B,
-                                float beta, int64_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No int64_t Gemm offering from MKLML. Directly fallback to Eigen.
-  GemmEigen<int64_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void Gemm<uint64_t, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, const int64_t M,
-                                 const int64_t N, const int64_t K, float alpha, const uint64_t* A, const uint64_t* B,
-                                 float beta, uint64_t* C, CPUMathUtil* /*provider*/, MLDataType /*math_type*/) {
-  // No uint64_t Gemm offering from MKLML. Directly fallback to Eigen.
-  GemmEigen<uint64_t>(TransA, TransB, M, N, K, alpha, A, B, beta, C);
-}
-
-template <>
-void GemmEx<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int M, int N, int K,
-                                float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
-                                int ldc, CPUMathUtil* /*context*/) {
+void GemmEx<float, ThreadPool>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int M, int N, int K,
+                               float alpha, const float* A, int lda, const float* B, int ldb, float beta, float* C,
+                               int ldc, ThreadPool* /*context*/) {
   cblas_sgemm(CblasRowMajor, TransA, TransB, M, N, K, alpha, A, lda, B, ldb,
               beta, C, ldc);
 }
 
 template <>
 void Gemv<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, int M, int N, float alpha, const float* A, const float* x,
-                              float beta, float* y, CPUMathUtil* /*context*/, MLDataType /*math_type*/) {
+                              float beta, float* y, CPUMathUtil* /*context*/) {
   cblas_sgemv(CblasRowMajor, TransA, M, N, alpha, A, N, x, 1, beta, y, 1);
 }
-
-#define CAFFE2_SPECIALIZED_SCALE(T, prefix)                                               \
-  template <>                                                                             \
-  void Scale<T, CPUMathUtil>(int n, float alpha, const T* x, T* y, CPUMathUtil*) {        \
-    if (y != x) cblas_##prefix##copy(n, x, 1, y, 1);                                      \
-    cblas_##prefix##scal(n, static_cast<float>(alpha), y, 1);                             \
-  }                                                                                       \
-  template <>                                                                             \
-  void Scale<T, CPUMathUtil>(int n, const float* alpha, const T* x, T* y, CPUMathUtil*) { \
-    if (y != x) cblas_##prefix##copy(n, x, 1, y, 1);                                      \
-    cblas_##prefix##scal(n, static_cast<float>(*alpha), y, 1);                            \
-  }
-CAFFE2_SPECIALIZED_SCALE(float, s)
-#undef CAFFE2_SPECIALIZED_SCALE
-
-#define CAFFE2_SPECIALIZED_DOT(T, prefix)                                       \
-  template <>                                                                   \
-  void Dot<T, CPUMathUtil>(int N, const T* a, const T* b, T* y, CPUMathUtil*) { \
-    *y = cblas_##prefix##dot(N, a, 1, b, 1);                                    \
-  }
-CAFFE2_SPECIALIZED_DOT(float, s)
-#undef CAFFE2_SPECIALIZED_DOT
 
 #define CAFFE2_SPECIALIZED_AXPY(T, prefix)                                           \
   template <>                                                                        \
@@ -408,52 +183,7 @@ CAFFE2_SPECIALIZED_DOT(float, s)
 CAFFE2_SPECIALIZED_AXPY(float, s)
 #undef CAFFE2_SPECIALIZED_AXPY
 
-#define CAFFE2_SPECIALIZED_AXPBY(T, prefix)                                                        \
-  template <>                                                                                      \
-  void Axpby<T, CPUMathUtil>(int N, const T alpha, const T* x, const T beta, T* y, CPUMathUtil*) { \
-    cblas_##prefix##scal(N, beta, y, 1);                                                           \
-    cblas_##prefix##axpy(N, alpha, x, 1, y, 1);                                                    \
-  }
-CAFFE2_SPECIALIZED_AXPBY(float, s)
-#undef CAFFE2_SPECIALIZED_AXPBY
-
-#endif  // USE_EIGEN_FOR_BLAS
-
-template <>
-void GemmBatched<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_TRANSPOSE TransB, int A_size,
-                                     int A_batches, int B_size, int B_batches, int M, int N, int K, float /*alpha*/,
-                                     const float* A, const float* B, float /*beta*/, float* C, CPUMathUtil* provider,
-                                     Tensor*, /* scratch */
-                                     MLDataType /* math_type */) {
-  auto a_offset = A_size / A_batches;
-  auto b_offset = B_size / B_batches;
-  auto y_offset = M * N;
-  // loop over matrices in the batch
-  for (int i = 0; i < A_batches; ++i) {
-    math::Gemm<float, CPUMathUtil>(
-        TransA,
-        TransB,
-        M,
-        N,
-        K,
-        1,
-        A + a_offset * i,
-        B + b_offset * i,
-        0,
-        C + y_offset * i,
-        provider);
-  }
-}
-
-  // MKL will be implmenet as an execution provider
-  ////////////////////////////////////////////////////////////////////////////////
-  // MKL VML alternatives.
-  // Depending on whether we are using MKL, we will delegate the Caffe math
-  // functions that are VML-related to either the VML call or the Eigen
-  // implementation. If you are setting the flags (such as AVX) right for your CPU
-  // architecture, usually Eigen will deliver a throughput as fast as the VML
-  // functions.
-  ////////////////////////////////////////////////////////////////////////////////
+#endif
 
 #define DELEGATE_SIMPLE_UNARY_FUNCTION(T, Funcname, expr)                  \
   template <>                                                              \
@@ -461,24 +191,8 @@ void GemmBatched<float, CPUMathUtil>(const CBLAS_TRANSPOSE TransA, const CBLAS_T
     EigenVectorMap<T>(y, N) = ConstEigenVectorMap<T>(x, N).array().expr(); \
   }
 DELEGATE_SIMPLE_UNARY_FUNCTION(float, Exp, exp)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, Log, log)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, Cos, cos)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, Sin, sin)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, Abs, abs)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, Sqrt, sqrt)
-DELEGATE_SIMPLE_UNARY_FUNCTION(float, InvSqrt, rsqrt)
 DELEGATE_SIMPLE_UNARY_FUNCTION(float, Sqr, square)
 #undef DELEGATE_SIMPLE_UNARY_FUNCTION
-
-#define DELEGATE_SINCOS_FUNCTION(T)                                            \
-  template <>                                                                  \
-  void SinCos<T, CPUMathUtil>(int N, const T* x, T* ys, T* yc, CPUMathUtil*) { \
-    EigenVectorMap<T>(ys, N) = ConstEigenVectorMap<T>(x, N).array().sin();     \
-    EigenVectorMap<T>(yc, N) = ConstEigenVectorMap<T>(x, N).array().cos();     \
-  }
-DELEGATE_SINCOS_FUNCTION(float)
-DELEGATE_SINCOS_FUNCTION(double)
-#undef DELEGATE_SINCOS_FUNCTION
 
 #define DELEGATE_POWX_FUNCTION(T)                                          \
   template <>                                                              \
@@ -500,9 +214,7 @@ DELEGATE_POWX_FUNCTION(float)
   EIGEN_SIMPLE_BINARY_FUNCTION(int64_t, Funcname, expr)
 
 DEFINE_SIMPLE_BINARY_FUNCTION(Add, +)
-DEFINE_SIMPLE_BINARY_FUNCTION(Sub, -)
 DEFINE_SIMPLE_BINARY_FUNCTION(Mul, *)
-DEFINE_SIMPLE_BINARY_FUNCTION(Div, /)
 
 #undef EIGEN_SIMPLE_BINARY_FUNCTION
 #undef DEFINE_FLOAT_BINARY_FUNCTION
@@ -513,41 +225,6 @@ DEFINE_SIMPLE_BINARY_FUNCTION(Div, /)
 // Eigen or via custom code.
 ////////////////////////////////////////////////////////////////////////////////
 
-#define SPECIALIZED_REDUCEMIN(T)                                                                               \
-  template <>                                                                                                  \
-  void ReduceMin<T, CPUMathUtil>(int N, const T* x, T* y, Tensor* /*scratch_ptr*/, CPUMathUtil* /*context*/) { \
-    *y = *std::min_element(x, x + N);                                                                          \
-  }
-SPECIALIZED_REDUCEMIN(float)
-#undef SPECIALIZED_REDUCEMIN
-
-#define SPECIALIZED_REDUCEMAX(T)                                                                               \
-  template <>                                                                                                  \
-  void ReduceMax<T, CPUMathUtil>(int N, const T* x, T* y, Tensor* /*scratch_ptr*/, CPUMathUtil* /*context*/) { \
-    *y = *std::max_element(x, x + N);                                                                          \
-  }
-SPECIALIZED_REDUCEMAX(float)
-SPECIALIZED_REDUCEMAX(int32_t)
-SPECIALIZED_REDUCEMAX(int64_t)
-
-#undef SPECIALIZED_REDUCEMAX
-
-#define SPECIALIZED_ROWWISESUM(T)                                                 \
-  template <>                                                                     \
-  void RowwiseSum<T, CPUMathUtil>(int N, int D, const T* x, T* y, CPUMathUtil*) { \
-    EigenVectorMap<T>(y, N) = ConstEigenMatrixMap<T>(x, D, N).colwise().sum();    \
-  }
-SPECIALIZED_ROWWISESUM(float)
-#undef SPECIALIZED_ROWWISESUM
-
-#define SPECIALIZED_COLWISESUM(T)                                                 \
-  template <>                                                                     \
-  void ColwiseSum<T, CPUMathUtil>(int N, int D, const T* x, T* y, CPUMathUtil*) { \
-    EigenVectorMap<T>(y, D) = ConstEigenMatrixMap<T>(x, D, N).rowwise().sum();    \
-  }
-SPECIALIZED_COLWISESUM(float)
-#undef SPECIALIZED_COLWISESUM
-
 #define SPECIALIZED_ROWWISEMAX(T)                                                   \
   template <>                                                                       \
   void RowwiseMax<T, CPUMathUtil>(int N, int D, const T* x, T* y, CPUMathUtil*) {   \
@@ -555,61 +232,6 @@ SPECIALIZED_COLWISESUM(float)
   }
 SPECIALIZED_ROWWISEMAX(float)
 #undef SPECIALIZED_ROWWISEMAX
-
-#define SPECIALIZED_COLWISEMAX(T)                                                   \
-  template <>                                                                       \
-  void ColwiseMax<T, CPUMathUtil>(int N, int D, const T* x, T* y, CPUMathUtil*) {   \
-    EigenVectorMap<T>(y, D) = ConstEigenMatrixMap<T>(x, D, N).rowwise().maxCoeff(); \
-  }
-SPECIALIZED_COLWISEMAX(float)
-#undef SPECIALIZED_COLWISEMAX
-
-#define SPECIALIZED_ELEMWISEMAX(T)                                                                  \
-  template <>                                                                                       \
-  void ElemwiseMax<T, CPUMathUtil>(int N, const T* x, const T* y, T* z, CPUMathUtil* /*context*/) { \
-    std::transform(x, x + N, y, z, [](const T& x_i, const T& y_i) { return std::max(x_i, y_i); });  \
-  }
-SPECIALIZED_ELEMWISEMAX(float)
-#undef SPECIALIZED_ELEMWISEMAX
-
-#define SPECIALIZED_MAXIMUM(T)                                                                    \
-  template <>                                                                                     \
-  void Maximum<T, CPUMathUtil>(int N, float alpha, const T* x, T* y, CPUMathUtil* /*provider*/) { \
-    std::transform(x, x + N, y, [&alpha](const T& x_i) { return std::max(x_i, alpha); });         \
-  }
-SPECIALIZED_MAXIMUM(float)
-#undef SPECIALIZED_MAXIMUM
-
-// AddToRow and AddToCol adds the corresponding row/col vector b to the matrix a
-// of shape M x N. The actual implementation uses eigen which is column major,
-// so notice the row/column swap in the actual implementation.
-#define DELEGATE_BROADCAST_BINARY_FUNCTION(T, Funcname, expr)                                                    \
-  template <>                                                                                                    \
-  void Funcname##ToRow<T, CPUMathUtil>(int M, int N, const T* a, const T* b, T* y, CPUMathUtil*) {               \
-    EigenArrayMap<T>(y, N, M) = ConstEigenArrayMap<T>(a, N, M).colwise() expr ConstEigenVectorArrayMap<T>(b, N); \
-  }                                                                                                              \
-  /* inplace versions */                                                                                         \
-  template <>                                                                                                    \
-  void Funcname##ToRow<T, CPUMathUtil>(int M, int N, const T* x, T* y, CPUMathUtil*) {                           \
-    EigenArrayMap<T>(y, N, M).colwise() expr## = ConstEigenVectorArrayMap<T>(x, N);                              \
-  }                                                                                                              \
-  template <>                                                                                                    \
-  void Funcname##ToCol<T, CPUMathUtil>(int M, int N, const T* x, T* y, CPUMathUtil*) {                           \
-    EigenArrayMap<T>(y, N, M).rowwise() expr## = ConstEigenVectorArrayMap<T>(x, M).transpose();                  \
-  }
-
-#define DEFINE_BROADCAST_BINARY_FUNCTION(name, op)      \
-  DELEGATE_BROADCAST_BINARY_FUNCTION(int32_t, name, op) \
-  DELEGATE_BROADCAST_BINARY_FUNCTION(int64_t, name, op) \
-  DELEGATE_BROADCAST_BINARY_FUNCTION(float, name, op)
-
-DEFINE_BROADCAST_BINARY_FUNCTION(Add, +)
-DEFINE_BROADCAST_BINARY_FUNCTION(Sub, -)
-DEFINE_BROADCAST_BINARY_FUNCTION(Mul, *)
-DEFINE_BROADCAST_BINARY_FUNCTION(Div, /)
-
-#undef DEFINE_BROADCAST_BINARY_FUNCTION
-#undef DELEGATE_BROADCAST_BINARY_FUNCTION
 
 #define SPECIALIZED_SET(T)                                                       \
   template <>                                                                    \
@@ -633,177 +255,11 @@ SPECIALIZED_SET(uint8_t);
 SPECIALIZED_SET(uint16_t);
 #undef SPECIALIZED_SET
 
-#define INSTANTIATE_BINARY_OP(name, op, T)                                                        \
-  template <>                                                                                     \
-  void name<T, CPUMathUtil>(int n, const T* a, const T* b, bool* y, CPUMathUtil*) {               \
-    for (int i = 0; i < n; ++i) {                                                                 \
-      y[i] = a[i] op b[i];                                                                        \
-    }                                                                                             \
-  }                                                                                               \
-  template <>                                                                                     \
-  void name##ToRow<T, CPUMathUtil>(int m, int n, const T* a, const T* b, bool* y, CPUMathUtil*) { \
-    for (int i = 0; i < n * m; ++i) {                                                             \
-      y[i] = a[i] op b[i % n];                                                                    \
-    }                                                                                             \
-  }
-
-#define DEFINE_BINARY_OP(name, op)         \
-  INSTANTIATE_BINARY_OP(name, op, float)   \
-  INSTANTIATE_BINARY_OP(name, op, int32_t) \
-  INSTANTIATE_BINARY_OP(name, op, int64_t)
-
-DEFINE_BINARY_OP(LT, <);
-DEFINE_BINARY_OP(LE, <=);
-DEFINE_BINARY_OP(GT, >);
-DEFINE_BINARY_OP(GE, >=);
-
-INSTANTIATE_BINARY_OP(Or, |, bool);
-INSTANTIATE_BINARY_OP(And, &, bool);
-INSTANTIATE_BINARY_OP(Xor, ^, bool);
-
-template <>
-void Not<bool, CPUMathUtil>(int n, const bool* x, bool* y, CPUMathUtil* /*context*/) {
-  for (int i = 0; i < n; ++i) {
-    y[i] = !x[i];
-  }
-}
-
-#undef DEFINE_BINARY_OP
-#undef INSTANTIATE_BINARY_OP
-
-#define SPECIALIZED_CPU_ADD_STRIPED_BATCH(T)                                                        \
-  template <>                                                                                       \
-  void AddStripedBatch(int N, const T* first, T* y, int stripe, int batch, CPUMathUtil* provider) { \
-    for (int j = 0; j < batch; j++) {                                                               \
-      Add<T, CPUMathUtil>(N, first + j * stripe, y, y, provider);                                   \
-    }                                                                                               \
-  }
-
-SPECIALIZED_CPU_ADD_STRIPED_BATCH(float);
-#undef SPECIALIZED_CPU_ADD_STRIPED_BATCH
-
-template <>
-void RandUniform<float, CPUMathUtil>(int n, float a, float b, const float* r, CPUMathUtil* /*provider*/) {
-  std::uniform_real_distribution<float> distribution(a, b);
-  //todo: need implmenet "RandGenerator()" in execution provider
-  ORT_UNUSED_PARAMETER(n);
-  ORT_UNUSED_PARAMETER(r);
-  ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
-  /*for (int i = 0; i < n; ++i) {
-                r[i] = distribution(context->RandGenerator());
-            }*/
-}
-
-template <>
-void RandUniform<int, CPUMathUtil>(int n, int a, int b, const int* r, CPUMathUtil* /*provider*/) {
-  std::uniform_int_distribution<int> distribution(a, b);
-  //todo: need implmenet "RandGenerator()" in execution provider
-  ORT_UNUSED_PARAMETER(n);
-  ORT_UNUSED_PARAMETER(r);
-  ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
-  /*for (int i = 0; i < n; ++i) {
-                r[i] = distribution(context->RandGenerator());
-            }*/
-}
-
-//todo: need implmenet "RandGenerator()" in execution provider
-
-//#define CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(T)                      \
-//  template <>                                                          \
-//  void RandUniformUnique<T, CPUContext>(                               \
-//      const size_t n,                                                  \
-//      const T a,                                                       \
-//      const T b,                                                       \
-//      T* r,                                                            \
-//      const size_t m,                                                  \
-//      const T* avoid,                                                  \
-//      CPUContext* context) {                                           \
-//    CAFFE_ENFORCE_LE(                                                  \
-//        n, b - a - m + 1, "Cannot satisfy the unique requirement");    \
-//    std::unordered_set<T> avoid_set(n);                                \
-//    if (m) {                                                           \
-//      avoid_set.insert(avoid, avoid + m);                              \
-//      CAFFE_ENFORCE_EQ(m, avoid_set.size(), "Avoid should be unique"); \
-//    }                                                                  \
-//    std::uniform_int_distribution<T> distribution(a, b);               \
-//    T v = 0;                                                           \
-//    for (size_t i = 0; i < n; ++i) {                                   \
-//      do {                                                             \
-//        v = distribution(context->RandGenerator());                    \
-//      } while (avoid_set.count(v));                                    \
-//      r[i] = v;                                                        \
-//      avoid_set.insert(v);                                             \
-//    }                                                                  \
-//  }
-//
-//        CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(int32_t);
-//        CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE(int64_t);
-//#undef CAFFE2_SPECIALIZED_RAND_UNIFORM_UNIQUE
-
-template <>
-void RandGaussian<float, CPUMathUtil>(int n, float mean, float std, const float* r, CPUMathUtil* /*provider*/) {
-  std::normal_distribution<float> distribution(mean, std);
-  ORT_UNUSED_PARAMETER(n);
-  ORT_UNUSED_PARAMETER(r);
-  ORT_NOT_IMPLEMENTED(__FUNCTION__, " is not implemented");
-  /*for (int i = 0; i < n; ++i) {
-                r[i] = distribution(context->RandGenerator());
-            }*/
-}
-
-#define SPECIALIZED_SUM(T)                                                                             \
-  template <>                                                                                          \
-  void Sum<T, CPUMathUtil>(int N, const T* x, T* y, CPUMathUtil* /* unused */, Tensor* /* unused */) { \
-    *y = ConstEigenVectorMap<T>(x, N).sum();                                                           \
-  }
-
-SPECIALIZED_SUM(float);
-SPECIALIZED_SUM(int32_t);
-SPECIALIZED_SUM(int64_t);
-
-#undef SPECIALIZED_SUM
-
-template <>
-void SumSqr<float, CPUMathUtil>(int N, const float* x, float* y, CPUMathUtil* /*context*/ /* unused */,
-                                Tensor* /*scratch_ptr*/ /* unused */) {
-  *y = ConstEigenVectorMap<float>(x, N).squaredNorm();
-}
-
-template <>
-void Select<float, CPUMathUtil>(int N, int D, const float* x, const int* idx, float* y, CPUMathUtil* /*context*/) {
-  for (int i = 0; i < N; ++i) {
-    ORT_ENFORCE(idx[i] < D);
-    y[i] = x[i * D + idx[i]];
-  }
-}
-
-template <>
-void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
-                                                      const int64_t* col_shape, int64_t img_size, int64_t col_size,
-                                                      const int64_t* kernel_shape, const int64_t* stride,
-                                                      const int64_t* dilation, const int64_t* pad, int64_t N,
-                                                      float* data_img, CPUMathUtil* context) {
-  Set<float, CPUMathUtil>(img_size, 0, data_img, context);
-  Im2colNd<float, CPUMathUtil, StorageOrder::NCHW>()(
-      data_col,
-      img_shape,
-      col_shape,
-      img_size,
-      col_size,
-      kernel_shape,
-      stride,
-      dilation,
-      pad,
-      N,
-      data_img,
-      context,
-      true);
-}
-
-static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const float* data_im, int64_t channels,
+template <typename T>
+static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const T* data_im, int64_t channels,
                                    int64_t height, int64_t width, int64_t kernel_h, int64_t kernel_w,
                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t, int64_t pad_l,
-                                   int64_t stride_h, int64_t stride_w, float* data_col) {
+                                   int64_t stride_h, int64_t stride_w, T* data_col, T padding_value) {
   // From Intel, https://github.com/BVLC/caffe/pull/3536
   int64_t pad_h = pad_t;
   int64_t pad_w = pad_l;
@@ -814,16 +270,16 @@ static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const flo
         int64_t input_row = -pad_h + kernel_row * dilation_h;
         for (int64_t output_rows = output_h; output_rows; output_rows--) {
           if (!is_a_ge_zero_and_a_lt_b(input_row, height)) {
-            memset(data_col, 0, output_w * sizeof(float));
+            std::fill_n(data_col, output_w, padding_value);
             data_col += output_w;
           } else {
             int64_t input_col = -pad_w + kernel_col * dilation_w;
-            const float* rdptr = data_im + input_row * width + input_col;
+            const T* rdptr = data_im + input_row * width + input_col;
             for (int64_t i = 0; i != output_w; ++i) {
               if (is_a_ge_zero_and_a_lt_b(input_col, width)) {
                 *(data_col++) = rdptr[i * stride_w];
               } else {
-                *(data_col++) = 0;
+                *(data_col++) = padding_value;
               }
               input_col += stride_w;
             }
@@ -834,12 +290,13 @@ static void Im2colWithEqualPadding(int64_t output_h, int64_t output_w, const flo
     }
   }
 }
-template <>
-void Im2col<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_im, int64_t channels, int64_t height,
-                                                    int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
-                                                    int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
-                                                    int64_t stride_w, float* data_col, CPUMathUtil* /*context*/) {
+
+template <typename T>
+void Im2col<T, StorageOrder::NCHW>::operator()(const T* data_im, int64_t channels, int64_t height,
+                                               int64_t width, int64_t kernel_h, int64_t kernel_w,
+                                               int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
+                                               int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
+                                               int64_t stride_w, T* data_col, T padding_value) {
   const int64_t output_h =
       (height + pad_b + pad_t - (dilation_h * (kernel_h - 1) + 1)) / stride_h +
       1;
@@ -866,13 +323,13 @@ void Im2col<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_im, int64_
           memcpy(
               dst + (y * output_w),
               src + (iy * width + ix),
-              sizeof(float) * output_w);
+              sizeof(T) * output_w);
         } else {
           for (auto x = 0; x < output_w; x++) {
             memcpy(
                 dst + (y * output_w + x),
                 src + (iy * width + ix + x * stride_w),
-                sizeof(float));
+                sizeof(T));
           }
         }
       }
@@ -882,7 +339,7 @@ void Im2col<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_im, int64_
 
   // Fast path for equal padding
   if (pad_l == pad_r && pad_t == pad_b) {
-    Im2colWithEqualPadding(output_h, output_w, data_im, channels, height, width, kernel_h, kernel_w, dilation_h, dilation_w, pad_t, pad_l, stride_h, stride_w, data_col);
+    Im2colWithEqualPadding(output_h, output_w, data_im, channels, height, width, kernel_h, kernel_w, dilation_h, dilation_w, pad_t, pad_l, stride_h, stride_w, data_col, padding_value);
     return;
   }
 
@@ -906,18 +363,21 @@ void Im2col<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_im, int64_
           data_col[(c * height_col + h) * width_col + w] =
               data_im[(c_im * height + h_pad) * width + w_pad];
         else
-          data_col[(c * height_col + h) * width_col + w] = 0;
+          data_col[(c * height_col + h) * width_col + w] = padding_value;
       }
     }
   }
 }
 
+template struct Im2col<float, StorageOrder::NCHW>;
+template struct Im2col<uint8_t, StorageOrder::NCHW>;
+
 template <>
-void Im2col<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_im, int64_t channels, int64_t height,
-                                                    int64_t width, int64_t kernel_h, int64_t kernel_w,
-                                                    int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
-                                                    int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
-                                                    int64_t stride_w, float* data_col, CPUMathUtil* /*context*/) {
+void Im2col<float, StorageOrder::NHWC>::operator()(const float* data_im, int64_t channels, int64_t height,
+                                                   int64_t width, int64_t kernel_h, int64_t kernel_w,
+                                                   int64_t dilation_h, int64_t dilation_w, int64_t pad_t,
+                                                   int64_t pad_l, int64_t pad_b, int64_t pad_r, int64_t stride_h,
+                                                   int64_t stride_w, float* data_col, float padding_value) {
   const int64_t dkernel_h = dilation_h * (kernel_h - 1) + 1;
   const int64_t dkernel_w = dilation_w * (kernel_w - 1) + 1;
 
@@ -934,8 +394,7 @@ void Im2col<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_im, int64_
             memcpy(data_col, data_im + (ih * width + iw) * channels,
                    sizeof(float) * channels);
           } else {
-            // This should be simply padded with zero.
-            memset(data_col, 0, sizeof(float) * channels);
+            std::fill_n(data_col, channels, padding_value);
           }
           data_col += channels;
         }
@@ -1082,6 +541,28 @@ void Col2im<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_col, int64
   }
 }
 
+template <>
+void Col2imNd<float, CPUMathUtil, StorageOrder::NCHW>(const float* data_col, const int64_t* img_shape,
+                                                      const int64_t* col_shape, int64_t img_size, int64_t col_size,
+                                                      const int64_t* kernel_shape, const int64_t* stride,
+                                                      const int64_t* dilation, const int64_t* pad, int64_t N,
+                                                      float* data_img, CPUMathUtil* context) {
+  Set<float, CPUMathUtil>(img_size, 0, data_img, context);
+  Im2colNd<float, StorageOrder::NCHW>()(
+      data_col,
+      img_shape,
+      col_shape,
+      img_size,
+      col_size,
+      kernel_shape,
+      stride,
+      dilation,
+      pad,
+      N,
+      data_img,
+      true);
+}
+
 #define SPECIALIZED_COPYVECTOR(T)                                                          \
   template <>                                                                              \
   void CopyVector<T, CPUMathUtil>(int N, const T* src, T* dst, CPUMathUtil* /*context*/) { \
@@ -1091,24 +572,6 @@ void Col2im<float, CPUMathUtil, StorageOrder::NHWC>(const float* data_col, int64
   }
 SPECIALIZED_COPYVECTOR(float)
 #undef SPECIALIZED_COPYVECTOR
-
-uint32_t randomNumberSeed() {
-  // Originally copied from folly::randomNumberSeed (at 418ad4)
-  // modified to use chrono instead of sys/time.h
-  static std::atomic<uint32_t> seedInput(0);
-  auto tv = std::chrono::system_clock::now().time_since_epoch();
-  uint64_t usec = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::microseconds>(tv).count());
-  uint32_t tv_sec = static_cast<uint32_t>(usec / 1000000);
-  uint32_t tv_usec = static_cast<uint32_t>(usec % 1000000);
-  const uint32_t kPrime0 = 51551;
-  const uint32_t kPrime1 = 61631;
-  const uint32_t kPrime2 = 64997;
-  const uint32_t kPrime3 = 111857;
-  static const uint32_t pid = static_cast<uint32_t>(Env::Default().GetSelfPid());
-  return kPrime0 * (seedInput++) + kPrime1 * pid +
-         kPrime2 * tv_sec + kPrime3 * tv_usec;
-}
 
 uint16_t floatToHalf(float f) {
   return Eigen::half_impl::float_to_half_rtne(f).x;

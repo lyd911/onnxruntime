@@ -1,0 +1,13 @@
+# Defined as pipeline variables
+# variables:
+#   AgentPoolLinux : 'Linux-CPU'
+#   AgentPoolMacOS : 'macOS-10.13'
+
+variables:
+  PackageName: 'Microsoft.ML.OnnxRuntime.MKLML'
+
+jobs: 
+- template: templates/cpu-mklml.yml
+  parameters:
+    AgentPool : 'Win-CPU-2019'
+    DoEsrp: 'false'

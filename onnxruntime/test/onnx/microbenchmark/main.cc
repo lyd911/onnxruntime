@@ -6,7 +6,7 @@
 #include <core/common/logging/logging.h>
 #include <core/platform/env.h>
 #include <core/providers/cpu/cpu_execution_provider.h>
-#include <core/framework/environment.h>
+#include "core/session/environment.h"
 #include <core/common/logging/sinks/clog_sink.h>
 #include <core/graph/model.h>
 #include <core/graph/graph.h>
@@ -28,7 +28,7 @@ BENCHMARK(BM_CPUAllocator)->Arg(4)->Arg(sizeof(Tensor));
 
 static void BM_ResolveGraph(benchmark::State& state) {
   std::shared_ptr<onnxruntime::Model> model_copy;
-  auto st = onnxruntime::Model::Load("../models/opset8/test_tiny_yolov2/model.onnx", model_copy);
+  auto st = onnxruntime::Model::Load(ORT_TSTR("../models/opset8/test_tiny_yolov2/model.onnx"), model_copy);
   if (!st.IsOK()) {
     printf("Parse model failed: %s", st.ErrorMessage().c_str());
     abort();

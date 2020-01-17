@@ -15,7 +15,20 @@ namespace cuda {
   ONNX_OPERATOR_VERSIONED_TYPED_KERNEL_EX(                           \
       BatchNormalization,                                            \
       kOnnxDomain,                                                   \
-      7, 9,                                                          \
+      7, 8,                                                          \
+      T,                                                             \
+      kCudaExecutionProvider,                                        \
+      KernelDefBuilder()                                             \
+          .TypeConstraint("X", DataTypeImpl::GetTensorType<T>())     \
+          .TypeConstraint("scale", DataTypeImpl::GetTensorType<T>()) \
+          .TypeConstraint("B", DataTypeImpl::GetTensorType<T>())     \
+          .TypeConstraint("mean", DataTypeImpl::GetTensorType<T>())  \
+          .TypeConstraint("var", DataTypeImpl::GetTensorType<T>()),  \
+      BatchNorm<T>);                                                 \
+  ONNX_OPERATOR_TYPED_KERNEL_EX(                                     \
+      BatchNormalization,                                            \
+      kOnnxDomain,                                                   \
+      9,                                                             \
       T,                                                             \
       kCudaExecutionProvider,                                        \
       KernelDefBuilder()                                             \
@@ -36,7 +49,7 @@ Status BatchNorm<T>::ComputeInternal(OpKernelContext* p_op_kernel_context) const
   const Tensor* mean = p_op_kernel_context->Input<Tensor>(3);
   const Tensor* var = p_op_kernel_context->Input<Tensor>(4);
 
-  ORT_RETURN_IF_ERROR(BatchNormHelper::ValidateInputs(X, scale, B, mean, var));
+  ORT_RETURN_IF_ERROR(BatchNormHelper::ValidateInputs(X, scale, B, mean, var, spatial_ == 1));
 
   const TensorShape& x_shape = X->Shape();
   Tensor* Y = p_op_kernel_context->Output(0, x_shape);
@@ -57,7 +70,7 @@ Status BatchNorm<T>::ComputeInternal(OpKernelContext* p_op_kernel_context) const
   ORT_RETURN_IF_ERROR(data_desc.Set(new_dims, CudnnTensor::GetDataType<CudaT>()));
 
   // For half data type, the alpha, beta, scale, B, mean, var need to be float type
-  if (X->DataType() == DataTypeImpl::GetType<MLFloat16>()) {
+  if (X->IsDataType<MLFloat16>()) {
     CudnnTensor scale_desc;
     ORT_RETURN_IF_ERROR(scale_desc.Set(new_dims, CudnnTensor::GetDataType<float>()));
     CudnnTensor bn_tensor_desc;

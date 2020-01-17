@@ -34,8 +34,11 @@ ptrdiff_t OrtStrToPtrDiff(const T* nptr, T** endptr);
 template <>
 inline ptrdiff_t OrtStrToPtrDiff<wchar_t>(const wchar_t* nptr, wchar_t** endptr) {
 #ifdef _WIN32
-  // TODO: on x86_32, it should be wcstol
+#ifdef _M_AMD64
   return _wcstoi64(nptr, endptr, 10);
+#else
+  return wcstol(nptr, endptr, 10);
+#endif
 #else
   return wcstol(nptr, endptr, 10);
 #endif
@@ -57,8 +60,11 @@ inline size_t OrtStrftime<wchar_t>(wchar_t* strDest, size_t maxsize, const wchar
 template <>
 inline ptrdiff_t OrtStrToPtrDiff<char>(const char* nptr, char** endptr) {
 #ifdef _WIN32
-  // TODO: on x86_32, it should be strtol
+#ifdef _M_AMD64
   return _strtoi64(nptr, endptr, 10);
+#else
+  return strtol(nptr, endptr, 10);
+#endif
 #else
   return strtol(nptr, endptr, 10);
 #endif
@@ -96,7 +102,14 @@ inline int CompareCString<wchar_t>(const wchar_t* s1, const wchar_t* s2) {
   return wcscmp(s1, s2);
 }
 
-enum class OrtFileType { TYPE_BLK, TYPE_CHR, TYPE_DIR, TYPE_FIFO, TYPE_LNK, TYPE_REG, TYPE_SOCK, TYPE_UNKNOWN };
+enum class OrtFileType { TYPE_BLK,
+                         TYPE_CHR,
+                         TYPE_DIR,
+                         TYPE_FIFO,
+                         TYPE_LNK,
+                         TYPE_REG,
+                         TYPE_SOCK,
+                         TYPE_UNKNOWN };
 
 template <typename PATH_CHAR_TYPE>
 PATH_CHAR_TYPE GetPathSep();
@@ -236,7 +249,7 @@ void LoopDir(const std::string& dir_name, T func) {
     auto e = errno;
     char buf[1024];
     char* msg;
-#if defined(__GLIBC__) && defined(_GNU_SOURCE) && !defined (__ANDROID__)
+#if defined(__GLIBC__) && defined(_GNU_SOURCE) && !defined(__ANDROID__)
     msg = strerror_r(e, buf, sizeof(buf));
 #else
     if (strerror_r(e, buf, sizeof(buf)) != 0) {
@@ -266,7 +279,8 @@ void LoopDir(const std::string& dir_name, T func) {
 template <typename T>
 inline T ReplaceFilename(const T& input, const T& new_value) {
   T ret;
-  ORT_ENFORCE(GetDirNameFromFilePath(input, ret).IsOK());
+  auto status = GetDirNameFromFilePath(input, ret);
+  ORT_ENFORCE(status.IsOK(), status.ErrorMessage());
   return ConcatPathComponent(ret, new_value);
 }
 

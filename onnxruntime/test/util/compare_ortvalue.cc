@@ -5,16 +5,45 @@
 #include <cmath>
 #include <sstream>
 
+#ifdef __GNUC__
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-qualifiers"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#else
+#pragma warning(push)
+#pragma warning(disable : 4018) /*'expression' : signed/unsigned mismatch */
+#pragma warning(disable : 4065) /*switch statement contains 'default' but no 'case' labels*/
+#pragma warning(disable : 4100)
+#pragma warning(disable : 4146) /*unary minus operator applied to unsigned type, result still unsigned*/
+#pragma warning(disable : 4244) /*'conversion' conversion from 'type1' to 'type2', possible loss of data*/
+#pragma warning(disable : 4251) /*'identifier' : class 'type' needs to have dll-interface to be used by clients of class 'type2'*/
+#pragma warning(disable : 4267) /*'var' : conversion from 'size_t' to 'type', possible loss of data*/
+#pragma warning(disable : 4305) /*'identifier' : truncation from 'type1' to 'type2'*/
+#pragma warning(disable : 4307) /*'operator' : integral constant overflow*/
+#pragma warning(disable : 4309) /*'conversion' : truncation of constant value*/
+#pragma warning(disable : 4334) /*'operator' : result of 32-bit shift implicitly converted to 64 bits (was 64-bit shift intended?)*/
+#pragma warning(disable : 4355) /*'this' : used in base member initializer list*/
+#pragma warning(disable : 4506) /*no definition for inline function 'function'*/
+#pragma warning(disable : 4800) /*'type' : forcing value to bool 'true' or 'false' (performance warning)*/
+#pragma warning(disable : 4996) /*The compiler encountered a deprecated declaration.*/
+#endif
 #ifdef USE_FULL_PROTOBUF
 #include <google/protobuf/message.h>
 #else
 #include <google/protobuf/message_lite.h>
 #endif
+#ifdef __GNUC__
+#pragma GCC diagnostic pop
+#else
+#pragma warning(pop)
+#endif
+
 
 #include "core/graph/onnx_protobuf.h"
 #include "core/framework/tensorprotoutils.h"
+#include "core/framework/utils.h"
 #include "Eigen/Core"
-#include "Eigen/src/Core/arch/GPU/Half.h"
+#include "Eigen/src/Core/arch/Default/Half.h"
 
 using namespace onnxruntime;
 
@@ -149,37 +178,36 @@ std::pair<COMPARE_RESULT, std::string> CompareTwoTensors(const Tensor& outvalue,
     oss << "shape mismatch, expect " << expected_tensor.Shape().ToString() << " got " << outvalue.Shape().ToString();
     return std::make_pair(COMPARE_RESULT::SHAPE_MISMATCH, oss.str());
   }
-  auto p1 = outvalue.DataType();
-  if (p1 == DataTypeImpl::GetType<float>()) {
+  if (outvalue.IsDataType<float>()) {
     return CompareFloatResult<float>(outvalue, expected_tensor, per_sample_tolerance, relative_per_sample_tolerance,
                                      post_processing);
-  } else if (p1 == DataTypeImpl::GetType<double>()) {
+  } else if (outvalue.IsDataType<double>()) {
     return CompareFloatResult<double>(outvalue, expected_tensor, per_sample_tolerance, relative_per_sample_tolerance,
                                       post_processing);
-  } else if (p1 == DataTypeImpl::GetType<std::string>()) {
+  } else if (outvalue.IsDataTypeString()) {
     return IsResultExactlyMatch<std::string>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<uint8_t>()) {
+  } else if (outvalue.IsDataType<uint8_t>()) {
     return IsResultExactlyMatch<uint8_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<int8_t>()) {
+  } else if (outvalue.IsDataType<int8_t>()) {
     return IsResultExactlyMatch<int8_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<uint16_t>()) {
+  } else if (outvalue.IsDataType<uint16_t>()) {
     return IsResultExactlyMatch<uint16_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<int16_t>()) {
+  } else if (outvalue.IsDataType<int16_t>()) {
     return IsResultExactlyMatch<int16_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<uint32_t>()) {
+  } else if (outvalue.IsDataType<uint32_t>()) {
     return IsResultExactlyMatch<uint32_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<int32_t>()) {
+  } else if (outvalue.IsDataType<int32_t>()) {
     return IsResultExactlyMatch<int32_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<uint64_t>()) {
+  } else if (outvalue.IsDataType<uint64_t>()) {
     return IsResultExactlyMatch<uint64_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<int64_t>()) {
+  } else if (outvalue.IsDataType<int64_t>()) {
     return IsResultExactlyMatch<int64_t>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<bool>()) {
+  } else if (outvalue.IsDataType<bool>()) {
     return IsResultExactlyMatch<bool>(outvalue, expected_tensor);
-  } else if (p1 == DataTypeImpl::GetType<MLFloat16>()) {
+  } else if (outvalue.IsDataType<MLFloat16>()) {
     return CompareFloat16Result(outvalue, expected_tensor, per_sample_tolerance, relative_per_sample_tolerance,
                                 post_processing);
-  } else if (p1 == DataTypeImpl::GetType<BFloat16>()) {
+  } else if (outvalue.IsDataType<BFloat16>()) {
     return CompareBFloat16Result(outvalue, expected_tensor, per_sample_tolerance, relative_per_sample_tolerance,
                                  post_processing);
   } else {
@@ -227,55 +255,7 @@ std::pair<COMPARE_RESULT, std::string> CompareSeqOfMapToFloat(const T& real_outp
 }
 
 const char* ElementTypeToString(MLDataType type) {
-  if (type == DataTypeImpl::GetType<float>()) {
-    return "tensor(float)";
-  } else if (type == DataTypeImpl::GetType<bool>()) {
-    return "tensor(bool)";
-  }
-
-  else if (type == DataTypeImpl::GetType<int32_t>()) {
-    return "tensor(int32)";
-  }
-
-  else if (type == DataTypeImpl::GetType<double>()) {
-    return "tensor(double)";
-  }
-
-  else if (type == DataTypeImpl::GetType<std::string>()) {
-    return "tensor(string)";
-  }
-
-  else if (type == DataTypeImpl::GetType<uint8_t>()) {
-    return "tensor(uint8)";
-  }
-
-  else if (type == DataTypeImpl::GetType<uint16_t>()) {
-    return "tensor(uint16)";
-  }
-
-  else if (type == DataTypeImpl::GetType<int16_t>()) {
-    return "tensor(int16)";
-  }
-
-  else if (type == DataTypeImpl::GetType<int64_t>()) {
-    return "tensor(int64)";
-  }
-
-  else if (type == DataTypeImpl::GetType<uint32_t>()) {
-    return "tensor(uint32)";
-  }
-
-  else if (type == DataTypeImpl::GetType<uint64_t>()) {
-    return "tensor(uint64)";
-  }
-
-  else if (type == DataTypeImpl::GetType<MLFloat16>()) {
-    return "tensor(MLFloat16)";
-  } else if (type == DataTypeImpl::GetType<BFloat16>()) {
-    return "tensor(bfloat16)";
-  } else {
-    return "unknown";
-  }
+  return DataTypeImpl::ToString(type);
 }
 
 // The expected_shape could contain unknown dimensions, but the real_shape cannot
@@ -284,12 +264,23 @@ bool AreShapesEqual(const std::vector<int64_t>& real_shape, const ::ONNX_NAMESPA
   if (len < 0) return false;
   if (real_shape.size() != static_cast<size_t>(len)) return false;
   for (int i = 0; i != len; ++i) {
-    if (!expected_shape.dim(i).has_dim_value()) {
-      // symbolic shape, cannot validate it right now, assume it matches every thing
-      continue;
+    const auto& dim = expected_shape.dim(i);
+    switch (dim.value_case()) {
+      case ONNX_NAMESPACE::TensorShapeProto::Dimension::kDimValue:
+        if (dim.dim_value() != real_shape[i]) return false;
+        break;
+      case ONNX_NAMESPACE::TensorShapeProto::Dimension::kDimParam:
+        // symbolic shape, cannot validate it right now, assume it matches every thing
+        // fall through
+      case ONNX_NAMESPACE::TensorShapeProto::Dimension::VALUE_NOT_SET:
+        // Value not set is treated as can not be validated
+        continue;
+        break;
+      // This is for unlikely case when we add new oneof value
+      default:
+        assert(false);
+        break;
     }
-    ::google::protobuf::int64 d = expected_shape.dim(i).dim_value();
-    if (d != real_shape[i]) return false;
   }
   return true;
 }
